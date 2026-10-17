@@ -1,0 +1,203 @@
+================================================================
+EPSE 单机版 —— 交卷结果 / 错题复核 / 重复交卷无反应 修复说明
+日期：2026-10-17
+适用目录：原始 EpseSingleV2.1（应用本 patch 包后）
+================================================================
+
+一、最初问题与原因
+
+1. 红色“交卷/提交”按钮 → 确认框 → 前端调用
+   POST /api-electron/examineeProgress/updateExam，examProgress=3。
+2. 单机模式后端 ExamineeProgressServiceImpl.updateExam 在
+   examProgress=3 时执行的是“清档”：
+     - 清空 examinee_question 的答案和判分
+     - 清空 exam_info.grade
+     - 把 examinee_progress.exam_progress 改回 1
+   后端故意把这次练习清档，方便下次重新做。
+3. 前端 ExamHeader 的确认交卷逻辑在 updateExam 成功后，对内置任务
+   （exam_category=1）直接执行 finalizeSubmitAndExit() → 跳回 /login。
+4. 所以最初表现是：点红色提交 → 回到登录页；没有“交卷成功”，
+   也看不到分数。nginx access.log 中 updateExam 返回 200，说明请求
+   本身成功，问题在前端展示和后端清档的配合。
+
+二、第二轮反馈的三个问题与根因
+
+1. 交卷后答题卡颜色没有刷新
+   - 正常答题卡组件 ExamSheet 只有“当前题/已答题”两种状态；
+   - 带“正确/错误/部分正确”颜色的是 ExamSheetAnswer，
+     只有 isViewAnswer === true 时才渲染；
+   - 上一版结果脚本只合并了 resultScore，没有设置
+     paperInfo.answerRevealed，所以仍显示普通答题卡。
+
+2. 有错题但看不到具体内容
+   - eqWithQuestionList 后端方法强制 withAnswer=2；
+   - SQL 只在 withAnswer=1 时才查询 q.answer，因此前端拿不到
+     正确答案，即使进入“查看答案”模式，参考答案也是空的；
+   - 现有后端接口 getExamineeQuestionCheckPage 的 SQL 明确查询了
+     q.answer / q.analysis / q.answer_image，并返回 resultScore，
+     可以直接用于错题复核，不需要改 jar。
+
+3. 确认提交按钮点击后无反应（严重）
+   - ui-actions.log 已复现：
+      10:30:38 第一次交卷成功，结果卡片出现；
+      10:30:47 点“返回登录”；
+      10:30:55 重新进入考试；
+      10:31:38 起连续点“确认提交”，日志全是
+      [EPSE-RESULT] 忽略重复交卷请求。
+   - 原因：结果脚本里的 submitted 变量在一次交卷成功后永久为 true，
+     SPA 从登录页重新进入考试不会重新加载脚本，后续交卷全部被拦截。
+   - 这正是“安全规范与职业素养、电气元件识别与检测答完后确认提交
+     无反应”的原因：该场考试之前已经交过一次。
+
+三、本次改动（v2）
+
+1. epse\nginx-1.22.1\dist\js\epse-submit-result.js
+   - submitted 状态改为按“考试会话”管理：
+       key = examineeCode + examId + examPaperCode；
+   - 结果卡片不存在、key 变化、或路由离开 /electronicExam 时自动
+     重置交卷状态；
+   - 重新进入考试后再次交卷可以正常触发，不需要重启程序；
+   - 结果卡片仍在时重复点确认仍会被忽略，避免重复提交。
+
+2. 交卷后切换到彩色答题卡
+   - 合并评分数据时同时提交 answerRevealed: true；
+   - V2.1 原始 app.491bc689.js 的 isViewAnswer 只认 URL 参数和
+     status=4，不认 answerRevealed；这就是第一轮反馈里“答完题后
+     答题卡仍是普通已答/未答、参考答案空白”的直接原因；
+   - 已在 app.491bc689.js 的 isViewAnswer getter 开头加入：
+       if (e.paperInfo && e.paperInfo.answerRevealed) return true;
+   - 现在右侧从 ExamSheet 切换为 ExamSheetAnswer，显示：
+       绿色 = 正确
+       红色 = 错误
+       黄色 = 部分得分
+   - 该模式同时启用主区域的参考答案显示。
+
+3. 读取参考答案和错题详情
+   - 优先调用：
+       GET /api-electron/examineeQuestion/getExamineeQuestionCheckPage
+         ?pageNum=1&pageSize=500
+         &examId=<examId>
+         &examineeCode=<examineeCode>
+   - 按 examineeCode 过滤，按 questionCode 合并：
+       eq.resultScore / eq.questionScore / eq.isAnswer
+       question.answer / question.answerImage / question.analysis
+   - 如果该接口返回空或失败，回退到 eqWithQuestionList 只取评分；
+     彩色答题卡仍可用，参考答案可能为空，日志会记录原因。
+
+4. 结果卡片增加“查看错题”
+   - 有错题/部分得分时显示“查看错题”，否则显示“查看答题卡”；
+   - 点击后跳到第一道错题（或第一道已答题），并自动把“参考答案”
+     面板滚动到可见区域；
+   - 右侧彩色答题卡也可以直接点任意题号查看该题；
+   - 主区域显示题干、考生答案和参考答案。
+
+5. 日志可读性
+   - 结果、复核数据、重复请求等日志改为 JSON 字符串；
+   - 日志仍写入 epse\logs\ui-actions.log。
+
+6. 结果卡片可拖动
+   - 按住卡片顶部“✓ 交卷成功”标题区域即可拖动；
+   - 拖动范围限制在当前窗口内，避免拖出屏幕；
+   - 卡片中的“查看错题”“返回登录”按钮仍可正常点击。
+
+7. 修复交卷后“操作台”滚动条不能拖动
+   - 原因：交卷后 isViewAnswer=true，触发原生 CSS
+        .viewAnswer:after { position:absolute; width:100%; height:100%; z-index:10 }
+     这个透明遮罩盖住了“操作台”的滚动条；
+   - 处理：body.epse-submitted 状态下隐藏该遮罩，内容统一
+     pointer-events:none，但单独把 .operate-area-container 设为
+     pointer-events:auto，保留其原生滚动条的拖动/滚轮；
+   - 这样交卷后仍可拖动“操作台”右侧的蓝色滚动条查看内容。
+
+8. epse\nginx-1.22.1\dist\index.html
+   - 结果脚本版本号改为 ?v=13；
+   - app.js / app.css 版本号改为 ?v=submitresult6，
+     避免 Electron/Edge 继续使用旧版 isViewAnswer。
+
+本补丁包替换了 epse-submit-result.js、index.html、app.491bc689.js
+和 app.asar（含主进程日志与启动/关闭清理）；
+没有修改 epse-electron-2.0.0.jar。
+
+四、测试步骤（请用户测试）
+
+1. 完全关闭 EPSE（任务管理器确认 EpseDesktop.exe / javaw.exe /
+   nginx.exe 无残留），重新启动。
+2. 用 准考证号 123456 / 身份证号 123456 登录，选择“学考样卷A”
+   （或 B/C）。
+3. 做几道题，点右上角红色“提交”按钮，勾选“确认提交”，再点红色
+   “确认提交”。
+4. 正常应看到：
+   - 右下角“✓ 交卷成功 / 得分 X / Y”结果卡片；
+   - 右侧答题卡变成彩色（正确/错误/部分得分）；
+   - 结果卡片有“查看错题”按钮；
+   - 点“查看错题”后主区域显示题干、你的答案和参考答案；
+   - 点彩色答题卡上的任意题号也能切换查看；
+   - 按住卡片顶部“✓ 交卷成功”标题区域，可以把卡片拖到窗口内
+     任意位置，方便查看被卡片挡住的题目内容。
+5. 点“返回登录”，重新进入同一场考试，再做几道题并交卷：
+   - “确认提交”必须正常出结果，不能无反应；
+   - 不需要重启程序。
+6. 专门测试“安全规范与职业素养”和“电气元件识别与检测”两个题目/
+   主题，确认交卷正常。
+
+五、日志排查
+
+如果结果卡片没出现、颜色不对或确认无反应，请发回：
+  epse\logs\ui-actions.log（最后 200 行）
+同时保留：
+  epse\logs\log_info.log / log_error.log
+  epse\nginx-1.22.1\logs\access.log
+
+重点看：
+  [EPSE-RESULT] helper loaded v2
+      → 新脚本已加载
+  [EPSE-RESULT] 开始处理交卷
+      → 确认交卷已进入新逻辑
+  [EPSE-RESULT] 复核数据 {"source":...,"rows":...,"withAnswer":...}
+      → 是否拿到参考答案/评分
+  [EPSE-RESULT] 交卷结果 {...}
+      → 实际分数、正确/错误数
+  [EPSE-RESULT] 重置交卷状态 {"reason":"leave-exam"...}
+      → 返回登录后状态已重置
+  [EPSE-RESULT] 忽略重复交卷请求
+      → 仅在结果卡片仍显示时出现才正常
+  [http] POST .../updateExam -> 200
+      → 只有点“返回登录”才会出现
+  [navigate] .../login
+      → 真正跳登录页的时机
+
+如果重新进入后仍连续出现“忽略重复交卷请求”，请把日志发回。
+如果只看到 updateExam/navigate、没有 [EPSE-RESULT]，说明浏览器还在用
+旧缓存，彻底关闭程序再启动一次（本次已加 ?v=13 和清缓存）。
+
+六、回滚方法
+
+本补丁包不包含备份文件；回滚时直接用最初的原版重新复制一份即可：
+  C:\Users\32189\Desktop\xuekao_skills\Backup\EpseSingleV2.1
+
+如果只是想撤销补丁覆盖的文件，也可以从原版复制回以下文件：
+1. epse\nginx-1.22.1\dist\js\app.491bc689.js
+2. epse\nginx-1.22.1\dist\index.html
+3. EpseDesktop\resources\app.asar
+4. 删除 epse\nginx-1.22.1\dist\js\epse-submit-result.js
+5. 还原 start.bat / stop.bat / OpenEPSE.bat 和 tools 目录
+
+七、注意
+
+- 本补丁只对内置任务/实训（exam_category=1）生效；正式考试
+  （exam_category=0）仍沿用原来的“等待监考教师审核”逻辑。
+- 后端在 updateExam(examProgress=3) 时清空答案/成绩，是原程序的单机
+  练习逻辑；本次没有改 jar，只在清空前把成绩读出来展示。
+- 如果交卷后直接关窗口（不点“返回登录”），不会调用 updateExam；
+  tools\reset-answers.ps1 仍会在关闭时清空本次作答，下次启动是空白卷。
+- 日志文件会持续追加，超过 5MB 会自动改名为 ui-actions.log.1。
+================================================================
+
+
+
+
+
+
+
+
+
