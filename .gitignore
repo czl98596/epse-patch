@@ -1,0 +1,4 @@
+# Release archives are distributed as GitHub Release assets.
+*.zip
+*.7z
+*.rar
