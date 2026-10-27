@@ -2,3 +2,6 @@
 *.zip
 *.7z
 *.rar
+
+# Named upgrade package tracked on main with Git LFS.
+!/patchv2.3.1.zip
